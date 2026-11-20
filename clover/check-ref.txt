@@ -1,0 +1,37 @@
+Here's a Python function that parses an ISO 8601 date string and returns a datetime object. I'll explain each step in detail.
+
+```python
+from datetime import datetime
+import re
+
+def parse_iso8601_date(date_string):
+    """
+    Parses an ISO 8601 date string and returns a datetime object.
+    
+    Args:
+        date_string (str): ISO 8601 formatted date string.
+        
+    Returns:
+        datetime: Parsed datetime object.
+        
+    Raises:
+        ValueError: If the date string is not in valid ISO 8601 format.
+    """
+    # Step 1: Validate the input is a string
+    if not isinstance(date_string, str):
+        raise ValueError("Input must be a string.")
+    
+    # Step 2: Define a regex pattern to match ISO 8601 date strings
+    # This pattern covers common ISO 8601 formats:
+    # - YYYY-MM-DDTHH:MM:SS
+    # - YYYY-MM-DDTHH:MM:SS.sss
+    # - YYYY-MM-DDTHH:MM:SS±HH:MM (with timezone offset)
+    # - YYYY-MM-DD (date only)
+    iso8601_pattern = r'^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:([+-]\d{2}):(\d{2}))?)?$'
+    
+    # Step 3: Match the pattern against the input string
+    match = re.match(iso8601_pattern, date_string)
+    if not match:
+        raise ValueError(f"Invalid ISO 8601 date string: {date_string}")
+    
+    #
