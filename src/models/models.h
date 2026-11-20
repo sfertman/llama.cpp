@@ -3020,6 +3020,8 @@ struct llama_model_clover_moe : public llama_model_base {
         ggml_tensor * build_layer_ffn(ggml_tensor * cur, int il);
         ggml_tensor * build_norm_gated(ggml_tensor * input, ggml_tensor * weights, ggml_tensor * gate, int il);
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(ggml_tensor * input, int il);
+        ggml_tensor * build_bf16_round(ggml_tensor * cur) const;
+        ggml_tensor * build_clover_l2_norm(ggml_tensor * cur);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

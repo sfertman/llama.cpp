@@ -1,5 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h"
+
+#include <cstdlib>
 
 void llama_model_clover_moe::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.n_embd_head_k() != hparams.n_embd_head_v()) {
@@ -155,7 +158,7 @@ llama_model_clover_moe::graph::graph(const llm_graph_params & params) :
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
-        ggml_tensor * inpSA = inpL;
+        ggml_tensor * inpSA = build_bf16_round(inpL);
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -176,7 +179,7 @@ llama_model_clover_moe::graph::graph(const llm_graph_params & params) :
         cur = ggml_add(ctx0, cur, inpSA);
         cb(cur, "attn_residual", il);
 
-        ggml_tensor * ffn_residual = cur;
+        ggml_tensor * ffn_residual = build_bf16_round(cur);
 
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
@@ -227,7 +230,7 @@ ggml_tensor * llama_model_clover_moe::graph::build_norm_gated(
         ggml_tensor * gate,
                 int   il) {
     auto * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, il);
-    return ggml_mul(ctx0, normalized, ggml_silu(ctx0, gate));
+    return build_bf16_round(ggml_mul(ctx0, normalized, ggml_silu(ctx0, gate)));
 }
 
 ggml_tensor * llama_model_clover_moe::graph::build_layer_attn(
@@ -271,7 +274,13 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn(
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
     Qcur = build_rope(Qcur, inp_pos, il);
+    Qcur = build_bf16_round(Qcur);
+
     Kcur = build_rope(Kcur, inp_pos, il);
+    // a BF16 cache rounds K when storing it, so rounding here first changes nothing and blocks rope fusion
+    if (inp->mctx->get_k(ctx0, il)->type != GGML_TYPE_BF16) {
+        Kcur = build_bf16_round(Kcur);
+    }
 
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
@@ -287,7 +296,7 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn(
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
 
-    cur = ggml_mul(ctx0, cur, gate_sigmoid);
+    cur = build_bf16_round(ggml_mul(ctx0, build_bf16_round(cur), gate_sigmoid));
     cb(cur, "attn_gated", il);
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
@@ -358,7 +367,7 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    ggml_tensor * conv_output_silu = build_bf16_round(ggml_silu(ctx0, conv_output_proper));
     cb(conv_output_silu, "conv_output_silu", il);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
@@ -388,10 +397,18 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, 1e-6f);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, 1e-6f);
+    q_conv = build_clover_l2_norm(q_conv);
+    k_conv = build_clover_l2_norm(k_conv);
+
+    // the reference rounds the chunked (prompt) inputs to bf16; single-token decode uses them as is
+    if (n_tokens != n_outputs) {
+        q_conv = build_bf16_round(q_conv);
+        k_conv = build_bf16_round(k_conv);
+        beta   = build_bf16_round(beta);
+    }
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    output = build_bf16_round(output);
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
@@ -424,6 +441,7 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_ffn(ggml_tensor * cur, 
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
+    moe_out = build_bf16_round(moe_out);
     cb(moe_out, "ffn_moe_out", il);
 
     if (model.layers[il].ffn_up_shexp != nullptr) {
@@ -435,7 +453,8 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_ffn(ggml_tensor * cur, 
         cb(ffn_shexp, "ffn_shexp", il);
 
         ggml_tensor * shared_gate;
-        shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        // reference order: elementwise product then row sum (a mat-vec sums in a different order)
+        shared_gate = ggml_sum_rows(ctx0, ggml_mul(ctx0, cur, model.layers[il].ffn_gate_inp_shexp));
         cb(shared_gate, "shared_expert_gate", il);
 
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
@@ -443,11 +462,29 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_ffn(ggml_tensor * cur, 
 
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        cur = build_bf16_round(ggml_add(ctx0, moe_out, ffn_shexp));
         cb(cur, "ffn_out", il);
     } else {
         cur = moe_out;
     }
 
     return cur;
+}
+
+// x / sqrt(sum(x^2) + 1e-6), in the reference's operation order
+ggml_tensor * llama_model_clover_moe::graph::build_clover_l2_norm(ggml_tensor * cur) {
+    cur = ggml_cont(ctx0, cur);
+    auto * squared = ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur));
+    auto * norm    = ggml_sqrt(ctx0, ggml_scale_bias(ctx0, squared, 1.0f, 1e-6f));
+    return ggml_div(ctx0, cur, norm);
+}
+
+// Clover's reference runs in bf16: round intermediate activations the same way
+ggml_tensor * llama_model_clover_moe::graph::build_bf16_round(ggml_tensor * cur) const {
+    // LLAMA_CLOVER_NO_BF16_ROUND=1 skips the rounding (measures its cost)
+    static const bool skip = std::getenv("LLAMA_CLOVER_NO_BF16_ROUND") && std::atoi(std::getenv("LLAMA_CLOVER_NO_BF16_ROUND")) != 0;
+    if (skip) {
+        return cur;
+    }
+    return ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_BF16), GGML_TYPE_F32);
 }
