@@ -62,6 +62,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -987,10 +988,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_ind[4];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
+    vk_pipeline pipeline_clover_fused[7];
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
@@ -1268,6 +1271,23 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct vk_clover_chain {
+    uint32_t mode;
+    ggml_tensor * tail;
+    const ggml_tensor * in[4]; // A, B, C, D (nullptr when unused)
+    uint32_t flags;
+    float p0, p1;
+    uint32_t L, nrows;
+    std::vector<ggml_tensor *> inner;
+    // memory read / written by the fused kernel (synchronization and allocation lifetimes)
+    std::vector<const ggml_tensor *> reads;
+    std::vector<const ggml_tensor *> writes;
+    // VK_CLOVER_GDN_STATE: state gather and write-back folded into the GDN kernel
+    const ggml_tensor * gdn_rows {};
+    const ggml_tensor * gdn_ids {};
+    const ggml_tensor * gdn_out {};
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1337,6 +1357,11 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+
+    // Clover graph chains fused by data flow: each runs at its tail node and its inner nodes are skipped.
+    std::unordered_map<const ggml_tensor *, vk_clover_chain> clover_chains;
+    std::unordered_set<const ggml_tensor *> clover_skip;
+    uint64_t clover_graph_sig {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

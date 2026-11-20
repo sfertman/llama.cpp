@@ -4158,17 +4158,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
-            size_t gdn_len;
+            size_t gdn_len, gdn_ind_len;
             const void * gdn_data;
+            const void * gdn_ind_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_ind_len = gated_delta_net_ind_f32_len;
+                gdn_ind_data = (const void *)gated_delta_net_ind_f32_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_ind_len = gated_delta_net_ind_f32_nocluster_len;
+                gdn_ind_data = (const void *)gated_delta_net_ind_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_ind_len = gated_delta_net_ind_f32_shmem_len;
+                gdn_ind_data = (const void *)gated_delta_net_ind_f32_shmem_data;
             }
 
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
@@ -4179,6 +4186,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
+            ggml_vk_create_pipeline2(device, device->pipeline_gated_delta_net_ind[si],
+                std::string(gdn_names[si][0]) + "_ind", gdn_ind_len, gdn_ind_data, "main", 8, sizeof(vk_op_gated_delta_net_ind_push_constants),
+                wg_denoms, {S_V, 0, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
         }
     }
 
@@ -4193,6 +4203,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    for (uint32_t m = 0; m < 7; ++m) {
+        ggml_vk_create_pipeline2(device, device->pipeline_clover_fused[m], "clover_fused_f32_" + std::to_string(m), clover_fused_f32_len, clover_fused_f32_data, "main", 5, sizeof(vk_op_clover_fused_push_constants), {1, 1, 1}, {m}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -13147,6 +13160,570 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
+// Clover graph chain fusion, matched by data flow. A chain is dispatched as one kernel at its tail
+// node; its inner nodes are skipped. Inner nodes must be used only inside the chain (graph-wide
+// use counts), and graph_optimize keeps the chain inputs alive until the tail (see add_alloc_dep).
+enum vk_clover_mode : uint32_t {
+    VK_CLOVER_ROUND, VK_CLOVER_L2_NORM, VK_CLOVER_GDN_GATE, VK_CLOVER_SHEXP,
+    VK_CLOVER_ATTN_GATE, VK_CLOVER_ROUND_ADD, VK_CLOVER_GATED_NORM, VK_CLOVER_GDN_STATE,
+};
+static const char * vk_clover_mode_names[] = {
+    "CLOVER_ROUND", "CLOVER_L2_NORM", "CLOVER_GDN_GATE", "CLOVER_SHEXP",
+    "CLOVER_ATTN_GATE", "CLOVER_ROUND_ADD", "CLOVER_GATED_NORM", "CLOVER_GDN_STATE",
+};
+
+static int32_t ggml_vk_clover_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t h = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (h == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, h)) {
+        return -1;
+    }
+    return cgraph->use_counts[h];
+}
+
+struct vk_clover_matcher {
+    const ggml_cgraph * cgraph;
+    const std::unordered_set<const ggml_tensor *> & claimed;
+    std::vector<ggml_tensor *> inner;
+
+    bool is_f32_compute(const ggml_tensor * t) const {
+        return t && t->type == GGML_TYPE_F32 && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && !claimed.count(t);
+    }
+    // f32 -> bf16 -> f32 cast pair (ggml_cast self-references its result in src[1])
+    const ggml_tensor * round_src(const ggml_tensor * t2) const {
+        if (!is_f32_compute(t2) || t2->op != GGML_OP_CPY || t2->src[1] != t2) {
+            return nullptr;
+        }
+        const ggml_tensor * t1 = t2->src[0];
+        if (!t1 || t1->op != GGML_OP_CPY || t1->type != GGML_TYPE_BF16 || t1->src[1] != t1 || claimed.count(t1) ||
+            !(t1->flags & GGML_TENSOR_FLAG_COMPUTE) || !t1->src[0] || t1->src[0]->type != GGML_TYPE_F32 ||
+            ggml_nelements(t1->src[0]) != ggml_nelements(t2)) {
+            return nullptr;
+        }
+        return t1->src[0];
+    }
+    void add_round(ggml_tensor * t2) {
+        inner.push_back(t2->src[0]);
+        inner.push_back(t2);
+    }
+    // input that is optionally a round pair: returns the value to read and whether to round it
+    const ggml_tensor * unwrap(const ggml_tensor * t, bool & round) {
+        round = false;
+        if (const ggml_tensor * s = round_src(t)) {
+            // a cast has a self-reference, so a single consumer gives a use count of 2
+            if (ggml_vk_clover_use_count(cgraph, t) == 2) {
+                add_round(const_cast<ggml_tensor *>(t));
+                round = true;
+                return s;
+            }
+        }
+        return t;
+    }
+    bool op_is(const ggml_tensor * t, ggml_op op) const {
+        return is_f32_compute(t) && t->op == op;
+    }
+    bool unary_is(const ggml_tensor * t, ggml_unary_op op) const {
+        return op_is(t, GGML_OP_UNARY) && ggml_get_unary_op(t) == op;
+    }
+    // every inner node must be used only by chain nodes
+    bool exclusive(const ggml_tensor * tail) const {
+        for (const ggml_tensor * t : inner) {
+            if (t == tail || t->view_src || (t->flags & GGML_TENSOR_FLAG_OUTPUT) || !(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                return false;
+            }
+            int32_t uses = 0;
+            auto count = [&](const ggml_tensor * n) {
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    uses += n->src[s] == t;
+                }
+            };
+            for (const ggml_tensor * n : inner) {
+                count(n);
+            }
+            count(tail);
+            if (ggml_vk_clover_use_count(cgraph, t) != uses) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// input layout: rows of ne0 contiguous elements, then ne1, then the rest (3 dims at most)
+static bool ggml_vk_clover_layout_ok(const ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && (ggml_is_contiguous(t) || t->ne[3] == 1);
+}
+
+static const ggml_tensor * ggml_vk_clover_base(const ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+// GATED_DELTA_NET (K == 1, one sequence) whose state comes from GET_ROWS of the recurrent cache and whose
+// final state is only copied back into the cache: read and write the cache rows inside the kernel.
+static bool ggml_vk_clover_match_gdn_state(const ggml_cgraph * cgraph, ggml_tensor * g, vk_clover_chain & ch) {
+    if (g->op != GGML_OP_GATED_DELTA_NET || g->type != GGML_TYPE_F32 || !(g->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+        ggml_get_op_params_i32(g, 0) != 1) {
+        return false;
+    }
+    const ggml_tensor * v = g->src[2];
+    const uint32_t S_v = (uint32_t) v->ne[0];
+    const uint32_t H = (uint32_t) v->ne[1];
+    if (v->ne[3] != 1 || g->src[3]->ne[0] == (int64_t) S_v || (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128)) {
+        return false;
+    }
+    const ggml_tensor * st = g->src[5];
+    const ggml_tensor * gr = ggml_vk_clover_base(st);
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || st->data != gr->data || !ggml_is_contiguous(st) ||
+        !(gr->flags & GGML_TENSOR_FLAG_COMPUTE) || (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * rows = gr->src[0];
+    const ggml_tensor * ids = gr->src[1];
+    const int64_t state_elems = (int64_t) S_v * S_v * H;
+    if (rows->type != GGML_TYPE_F32 || rows->nb[0] != sizeof(float) || rows->ne[0] != state_elems ||
+        ids->type != GGML_TYPE_I32 || ggml_nelements(ids) < 1 || gr->ne[0] != state_elems) {
+        return false;
+    }
+    const size_t s_off_bytes = (size_t) S_v * H * v->ne[2] * v->ne[3] * sizeof(float);
+    ggml_tensor * out = nullptr;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * n = cgraph->nodes[i];
+        if ((n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) || n->op == GGML_OP_NONE) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = n->src[j];
+            if (!src || src == n) {
+                continue;
+            }
+            const ggml_tensor * base = ggml_vk_clover_base(src);
+            if (base == gr && n != g && !ggml_is_empty(n)) {
+                return false; // something else reads the gathered state
+            }
+            if (base == g && n != g) {
+                const char * lo = (const char *) src->data;
+                const char * state_lo = (const char *) g->data + s_off_bytes;
+                const bool reads_state = lo + ggml_nbytes(src) > state_lo;
+                if (!reads_state) {
+                    continue;
+                }
+                if (n->op != GGML_OP_CPY || j != 0 || lo != state_lo || out || ggml_nelements(src) != state_elems ||
+                    !ggml_is_contiguous(src) || !ggml_is_contiguous(n) || n->type != GGML_TYPE_F32 ||
+                    !(n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                    return false;
+                }
+                out = n;
+            }
+        }
+    }
+    if (!out || ggml_vk_clover_base(out) != ggml_vk_clover_base(rows)) {
+        return false;
+    }
+    // the write-back must land inside the bound cache rows
+    const char * rows_lo = (const char *) rows->data;
+    if ((const char *) out->data < rows_lo || (const char *) out->data + ggml_nbytes(out) > rows_lo + ggml_nbytes(rows)) {
+        return false;
+    }
+    ch = {};
+    ch.mode = VK_CLOVER_GDN_STATE;
+    ch.tail = g;
+    ch.inner = { const_cast<ggml_tensor *>(gr), out };
+    ch.gdn_rows = rows;
+    ch.gdn_ids = ids;
+    ch.gdn_out = out;
+    for (int j = 0; j < 5; ++j) {
+        ch.reads.push_back(g->src[j]);
+    }
+    ch.reads.push_back(rows);
+    ch.reads.push_back(ids);
+    ch.writes = { g, out };
+    return true;
+}
+
+static bool ggml_vk_clover_match(const ggml_cgraph * cgraph, ggml_tensor * tail,
+                                 const std::unordered_set<const ggml_tensor *> & claimed, vk_clover_chain & ch) {
+    if (tail->op == GGML_OP_GATED_DELTA_NET) {
+        static const bool gdn_state = getenv("LLAMA_CLOVER_NO_GDN_STATE_FUSION") == nullptr;
+        return gdn_state && ggml_vk_clover_match_gdn_state(cgraph, tail, ch) && !claimed.count(ch.inner[0]) && !claimed.count(ch.inner[1]);
+    }
+    vk_clover_matcher m { cgraph, claimed, {} };
+    if (!m.is_f32_compute(tail) || !ggml_is_contiguous(tail) || ggml_nrows(tail) > 65535 ||
+        ggml_nelements(tail) > 65535ll * 128) {
+        return false;
+    }
+    ch = {};
+    ch.tail = tail;
+    ch.L = (uint32_t) tail->ne[0];
+    ch.nrows = (uint32_t) ggml_nrows(tail);
+
+    if (const ggml_tensor * x = m.round_src(tail)) {
+        m.inner.push_back(tail->src[0]);
+        ch.flags = 4; // round output
+        ggml_tensor * xx = const_cast<ggml_tensor *>(x);
+        // shared expert tail: moe_out + shexp * sigmoid(sum_rows(x * w))
+        if (m.op_is(x, GGML_OP_ADD)) {
+            for (int o = 0; o < 2; ++o) {
+                const ggml_tensor * gated = x->src[1 - o];
+                if (!m.op_is(gated, GGML_OP_MUL) || !m.unary_is(gated->src[1], GGML_UNARY_OP_SIGMOID)) {
+                    continue;
+                }
+                const ggml_tensor * sig = gated->src[1];
+                const ggml_tensor * sum = sig->src[0];
+                if (!m.op_is(sum, GGML_OP_SUM_ROWS) || !m.op_is(sum->src[0], GGML_OP_MUL)) {
+                    continue;
+                }
+                const ggml_tensor * prod = sum->src[0];
+                const ggml_tensor * xin = prod->src[0];
+                const ggml_tensor * w = prod->src[1];
+                const ggml_tensor * sh = gated->src[0];
+                if (!ggml_is_contiguous(xin) || !ggml_are_same_shape(xin, tail) || ggml_nelements(w) != tail->ne[0] ||
+                    !ggml_is_contiguous(w) || !ggml_are_same_shape(sh, tail) || !ggml_vk_clover_layout_ok(sh) ||
+                    w->type != GGML_TYPE_F32 || xin->type != GGML_TYPE_F32) {
+                    continue;
+                }
+                bool r = false;
+                const size_t keep = m.inner.size();
+                const ggml_tensor * moe = m.unwrap(x->src[o], r);
+                if (ggml_nelements(moe) != ggml_nelements(tail) || !ggml_vk_clover_layout_ok(moe)) {
+                    m.inner.resize(keep);
+                    continue;
+                }
+                m.inner.insert(m.inner.end(), { xx, const_cast<ggml_tensor *>(gated), const_cast<ggml_tensor *>(sig),
+                                                const_cast<ggml_tensor *>(sum), const_cast<ggml_tensor *>(prod) });
+                ch.mode = VK_CLOVER_SHEXP;
+                ch.in[0] = moe; ch.in[1] = sh; ch.in[2] = xin; ch.in[3] = w;
+                ch.flags |= r ? 1 : 0;
+                goto done;
+            }
+        }
+        if (m.op_is(x, GGML_OP_MUL)) {
+            // attention output gate: round(attn) * sigmoid(cont(gate view))
+            const ggml_tensor * sig = x->src[1];
+            if (m.unary_is(sig, GGML_UNARY_OP_SIGMOID) && m.op_is(sig->src[0], GGML_OP_CONT) &&
+                ggml_vk_clover_layout_ok(sig->src[0]->src[0]) && ggml_nelements(sig) == ggml_nelements(tail)) {
+                bool r = false;
+                const size_t keep = m.inner.size();
+                const ggml_tensor * a = m.unwrap(x->src[0], r);
+                if (ggml_nelements(a) == ggml_nelements(tail) && ggml_vk_clover_layout_ok(a)) {
+                    m.inner.insert(m.inner.end(), { xx, const_cast<ggml_tensor *>(sig), sig->src[0] });
+                    ch.mode = VK_CLOVER_ATTN_GATE;
+                    ch.in[0] = a; ch.in[1] = sig->src[0]->src[0];
+                    ch.flags |= r ? 1 : 0;
+                    goto done;
+                }
+                m.inner.resize(keep);
+            }
+            // gated rms norm: (rms_norm(round(x)) * w) * silu(z)
+            const ggml_tensor * nm = x->src[0];
+            const ggml_tensor * si = x->src[1];
+            if (m.op_is(nm, GGML_OP_MUL) && m.op_is(nm->src[0], GGML_OP_RMS_NORM) && m.unary_is(si, GGML_UNARY_OP_SILU) &&
+                ggml_are_same_shape(nm, tail) && ggml_are_same_shape(si, tail) && ggml_vk_clover_layout_ok(si->src[0]) &&
+                ggml_are_same_shape(si->src[0], tail)) {
+                const ggml_tensor * rms = nm->src[0];
+                const ggml_tensor * w = nm->src[1];
+                if (ggml_is_contiguous(w) && ggml_nelements(w) == tail->ne[0] && w->type == GGML_TYPE_F32 &&
+                    ggml_are_same_shape(rms, tail)) {
+                    bool r = false;
+                    const size_t keep = m.inner.size();
+                    const ggml_tensor * a = m.unwrap(rms->src[0], r);
+                    if (ggml_nelements(a) == ggml_nelements(tail) && ggml_vk_clover_layout_ok(a)) {
+                        m.inner.insert(m.inner.end(), { xx, const_cast<ggml_tensor *>(nm), const_cast<ggml_tensor *>(rms),
+                                                        const_cast<ggml_tensor *>(si) });
+                        ch.mode = VK_CLOVER_GATED_NORM;
+                        ch.in[0] = a; ch.in[1] = si->src[0]; ch.in[3] = w;
+                        ch.p0 = ggml_get_op_params_f32(rms, 0);
+                        ch.flags |= r ? 1 : 0;
+                        goto done;
+                    }
+                    m.inner.resize(keep);
+                }
+            }
+        }
+        if (ggml_vk_clover_layout_ok(x)) {
+            ch.mode = VK_CLOVER_ROUND;
+            ch.in[0] = x;
+            goto done;
+        }
+        return false;
+    } else if (m.op_is(tail, GGML_OP_ADD)) {
+        // shared expert tail without output rounding: moe_out + shexp * sigmoid(sum_rows(x * w))
+        for (int o = 0; o < 2; ++o) {
+            const ggml_tensor * gated = tail->src[1 - o];
+            if (!m.op_is(gated, GGML_OP_MUL) || !m.unary_is(gated->src[1], GGML_UNARY_OP_SIGMOID)) {
+                continue;
+            }
+            const ggml_tensor * sig = gated->src[1];
+            const ggml_tensor * sum = sig->src[0];
+            if (!m.op_is(sum, GGML_OP_SUM_ROWS) || !m.op_is(sum->src[0], GGML_OP_MUL)) {
+                continue;
+            }
+            const ggml_tensor * prod = sum->src[0];
+            const ggml_tensor * xin = prod->src[0];
+            const ggml_tensor * w = prod->src[1];
+            const ggml_tensor * sh = gated->src[0];
+            if (!ggml_is_contiguous(xin) || !ggml_are_same_shape(xin, tail) || ggml_nelements(w) != tail->ne[0] ||
+                !ggml_is_contiguous(w) || !ggml_are_same_shape(sh, tail) || !ggml_vk_clover_layout_ok(sh) ||
+                w->type != GGML_TYPE_F32 || xin->type != GGML_TYPE_F32) {
+                continue;
+            }
+            bool r = false;
+            const ggml_tensor * moe = m.unwrap(tail->src[o], r);
+            if (ggml_nelements(moe) != ggml_nelements(tail) || !ggml_vk_clover_layout_ok(moe)) {
+                return false;
+            }
+            m.inner.insert(m.inner.end(), { const_cast<ggml_tensor *>(gated), const_cast<ggml_tensor *>(sig),
+                                            const_cast<ggml_tensor *>(sum), const_cast<ggml_tensor *>(prod) });
+            ch.mode = VK_CLOVER_SHEXP;
+            ch.in[0] = moe; ch.in[1] = sh; ch.in[2] = xin; ch.in[3] = w;
+            ch.flags = r ? 1 : 0;
+            goto done;
+        }
+        // residual add of a rounded tensor
+        if (!ggml_are_same_shape(tail->src[0], tail->src[1])) {
+            return false;
+        }
+        bool ra = false, rb = false;
+        const ggml_tensor * a = m.unwrap(tail->src[0], ra);
+        const ggml_tensor * b = m.unwrap(tail->src[1], rb);
+        if (!ra && !rb) {
+            return false;
+        }
+        if (!ggml_vk_clover_layout_ok(a) || !ggml_vk_clover_layout_ok(b) ||
+            ggml_nelements(a) != ggml_nelements(tail) || ggml_nelements(b) != ggml_nelements(tail)) {
+            return false;
+        }
+        ch.mode = VK_CLOVER_ROUND_ADD;
+        ch.in[0] = a; ch.in[1] = b;
+        ch.flags = (ra ? 1 : 0) | (rb ? 2 : 0);
+        goto done;
+    } else if (m.op_is(tail, GGML_OP_DIV)) {
+        // l2 norm: x / sqrt(sum_rows(sqr(x)) * s + b), x = cont(view)
+        const ggml_tensor * c = tail->src[0];
+        const ggml_tensor * sq = tail->src[1];
+        if (!m.op_is(c, GGML_OP_CONT) || !m.op_is(sq, GGML_OP_SQRT) || !m.op_is(sq->src[0], GGML_OP_SCALE)) {
+            return false;
+        }
+        const ggml_tensor * sc = sq->src[0];
+        const ggml_tensor * sr = sc->src[0];
+        if (!m.op_is(sr, GGML_OP_SUM_ROWS) || !m.op_is(sr->src[0], GGML_OP_SQR) || sr->src[0]->src[0] != c) {
+            return false;
+        }
+        const ggml_tensor * v = c->src[0];
+        if (!ggml_vk_clover_layout_ok(v) || !ggml_are_same_shape(v, tail)) {
+            return false;
+        }
+        m.inner.insert(m.inner.end(), { const_cast<ggml_tensor *>(c), sr->src[0], const_cast<ggml_tensor *>(sr),
+                                        const_cast<ggml_tensor *>(sc), const_cast<ggml_tensor *>(sq) });
+        ch.mode = VK_CLOVER_L2_NORM;
+        ch.in[0] = v;
+        ch.p0 = ggml_get_op_params_f32(sc, 0);
+        ch.p1 = ggml_get_op_params_f32(sc, 1);
+        goto done;
+    } else if (m.op_is(tail, GGML_OP_MUL)) {
+        // gdn gate: softplus(alpha + dt) * -exp(A_log)
+        for (int o = 0; o < 2; ++o) {
+            const ggml_tensor * sp = tail->src[o];
+            const ggml_tensor * ng = tail->src[1 - o];
+            if (!m.unary_is(sp, GGML_UNARY_OP_SOFTPLUS) || !m.unary_is(ng, GGML_UNARY_OP_NEG) || !m.unary_is(ng->src[0], GGML_UNARY_OP_EXP)) {
+                continue;
+            }
+            const ggml_tensor * add = sp->src[0];
+            const ggml_tensor * ex = ng->src[0];
+            if (!m.op_is(add, GGML_OP_ADD) || !ggml_are_same_shape(add, tail)) {
+                continue;
+            }
+            const ggml_tensor * alpha = add->src[0];
+            const ggml_tensor * dt = add->src[1];
+            const ggml_tensor * alog = ex->src[0];
+            if (!ggml_vk_clover_layout_ok(alpha) || !ggml_are_same_shape(alpha, tail) ||
+                !ggml_is_contiguous(dt) || ggml_nelements(dt) != tail->ne[0] || dt->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(alog) || ggml_nelements(alog) != tail->ne[0] || alog->type != GGML_TYPE_F32 ||
+                ggml_nelements(ng) != tail->ne[0]) {
+                continue;
+            }
+            m.inner.insert(m.inner.end(), { const_cast<ggml_tensor *>(add), const_cast<ggml_tensor *>(sp),
+                                            const_cast<ggml_tensor *>(ex), const_cast<ggml_tensor *>(ng) });
+            ch.mode = VK_CLOVER_GDN_GATE;
+            ch.in[0] = alpha; ch.in[1] = dt; ch.in[2] = alog;
+            goto done;
+        }
+        return false;
+    } else {
+        return false;
+    }
+
+done:
+    {
+        // LLAMA_CLOVER_VK_FUSION_MODES: bitmask of enabled chain modes (debug)
+        static const uint32_t modes = [] {
+            const char * e = getenv("LLAMA_CLOVER_VK_FUSION_MODES");
+            return e ? (uint32_t) std::strtoul(e, nullptr, 0) : 0xffu;
+        }();
+        if (!(modes & (1u << ch.mode))) {
+            return false;
+        }
+    }
+    if (!m.exclusive(tail)) {
+        return false;
+    }
+    ch.inner = std::move(m.inner);
+    for (const ggml_tensor * in : ch.in) {
+        if (in) {
+            ch.reads.push_back(in);
+        }
+    }
+    ch.writes = { tail };
+    return true;
+}
+
+static bool ggml_vk_clover_enabled() {
+    static const bool enabled = getenv("LLAMA_CLOVER_NO_VK_FUSION") == nullptr;
+    return enabled;
+}
+
+// Finds all chains in the graph; later (tail-side) chains are matched first so they claim their inputs.
+static void ggml_vk_clover_detect(const ggml_cgraph * cgraph, std::unordered_map<const ggml_tensor *, vk_clover_chain> & chains,
+                                  std::unordered_set<const ggml_tensor *> & skip) {
+    chains.clear();
+    skip.clear();
+    if (!ggml_vk_clover_enabled()) {
+        return;
+    }
+    for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (skip.count(node)) {
+            continue;
+        }
+        vk_clover_chain ch;
+        if (ggml_vk_clover_match(cgraph, node, skip, ch)) {
+            for (ggml_tensor * t : ch.inner) {
+                skip.insert(t);
+            }
+            skip.insert(node);
+            chains.emplace(node, std::move(ch));
+        }
+    }
+    for (const auto & it : chains) {
+        skip.erase(it.first);
+    }
+}
+
+static uint64_t ggml_vk_clover_graph_sig(const ggml_cgraph * cgraph) {
+    uint64_t h = 1469598103934665603ULL ^ (uint64_t) cgraph->n_nodes;
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
+    // a rebuilt graph can reuse the same tensor addresses and ops with different shapes,
+    // so the shapes and strides are part of the signature (chains cache row counts and layouts)
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        mix((uint64_t) (uintptr_t) n);
+        mix((uint64_t) n->op);
+        mix((uint64_t) (uintptr_t) n->src[0]);
+        mix((uint64_t) (uintptr_t) n->src[1]);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix((uint64_t) n->ne[d]);
+            mix((uint64_t) n->nb[d]);
+        }
+        mix((uint64_t) n->view_offs);
+        mix((uint64_t) n->flags);
+    }
+    return h;
+}
+
+static void ggml_vk_clover_fill_input(const ggml_backend_vk_context * ctx, const ggml_tensor * t, uint32_t L, uint32_t nrows_hint, uint32_t * out) {
+    out[0] = get_misalign_bytes(ctx, t) / sizeof(float);
+    if (ggml_vk_clover_layout_ok(t) && ggml_is_contiguous(t)) {
+        // 0 = contiguous with the output's size; smaller tensors are broadcast along the output rows
+        out[1] = (uint32_t) ggml_nelements(t) == L * nrows_hint ? 0 : (uint32_t) ggml_nelements(t);
+        out[2] = 1;
+        out[3] = 0;
+        out[4] = 0;
+    } else {
+        out[1] = (uint32_t) t->ne[0];
+        out[2] = (uint32_t) t->ne[1];
+        out[3] = (uint32_t) (t->nb[1] / sizeof(float));
+        out[4] = (uint32_t) (t->nb[2] / sizeof(float));
+    }
+}
+
+static void ggml_vk_clover_gdn_state(ggml_backend_vk_context * ctx, vk_context & subctx, const vk_clover_chain & ch) {
+    ggml_tensor * dst = ch.tail;
+    const ggml_tensor * src_q    = dst->src[0];
+    const ggml_tensor * src_v    = dst->src[2];
+    const ggml_tensor * src_beta = dst->src[4];
+
+    const uint32_t S_v      = (uint32_t)src_v->ne[0];
+    const uint32_t H        = (uint32_t)src_v->ne[1];
+    const uint32_t n_tokens = (uint32_t)src_v->ne[2];
+    const uint32_t n_seqs   = (uint32_t)src_v->ne[3];
+    const uint32_t si = S_v == 16 ? 0 : S_v == 32 ? 1 : S_v == 64 ? 2 : 3;
+
+    vk_pipeline pipeline = ctx->device->pipeline_gated_delta_net_ind[si];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer src_buf[5];
+    for (int i = 0; i < 5; i++) {
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+    vk_subbuffer rows_buf = ggml_vk_tensor_subbuffer(ctx, ch.gdn_rows, true);
+    vk_subbuffer ids_buf  = ggml_vk_tensor_subbuffer(ctx, ch.gdn_ids, true);
+    const uint32_t rows_misalign = get_misalign_bytes(ctx, ch.gdn_rows) / sizeof(float);
+    const size_t out_delta = (const char *) ch.gdn_out->data - (const char *) ch.gdn_rows->data;
+
+    vk_op_gated_delta_net_ind_push_constants pc {};
+    pc.base = {
+        H, n_tokens, n_seqs, S_v * H * n_tokens * n_seqs,
+        (uint32_t)(src_q->nb[1] / sizeof(float)), (uint32_t)(src_q->nb[2] / sizeof(float)), (uint32_t)(src_q->nb[3] / sizeof(float)),
+        (uint32_t)(src_v->nb[1] / sizeof(float)), (uint32_t)(src_v->nb[2] / sizeof(float)), (uint32_t)(src_v->nb[3] / sizeof(float)),
+        (uint32_t)(src_beta->nb[1] / sizeof(float)), (uint32_t)(src_beta->nb[2] / sizeof(float)), (uint32_t)(src_beta->nb[3] / sizeof(float)),
+        (uint32_t)src_q->ne[1], (uint32_t)(src_v->ne[3] / src_q->ne[3]),
+        1.0f / sqrtf((float)S_v),
+        1u,
+    };
+    pc.ids_off = get_misalign_bytes(ctx, ch.gdn_ids) / sizeof(int32_t);
+    pc.row_elems = (uint32_t)(ch.gdn_rows->nb[1] / sizeof(float));
+    pc.state_in_off = rows_misalign;
+    pc.state_out_off = rows_misalign + (uint32_t)(out_delta / sizeof(float));
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], rows_buf, dst_buf, ids_buf},
+        pc, { H, n_seqs, S_v });
+}
+
+static void ggml_vk_clover_fused(ggml_backend_vk_context * ctx, vk_context & subctx, const vk_clover_chain & ch) {
+    if (ch.mode == VK_CLOVER_GDN_STATE) {
+        ggml_vk_clover_gdn_state(ctx, subctx, ch);
+        return;
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_clover_fused[ch.mode];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_clover_fused_push_constants pc {};
+    pc.L = ch.L;
+    pc.nrows = ch.nrows;
+    pc.flags = ch.flags;
+    pc.p0 = ch.p0;
+    pc.p1 = ch.p1;
+    pc.dst_off = get_misalign_bytes(ctx, ch.tail) / sizeof(float);
+
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, ch.tail, true);
+    vk_subbuffer bufs[4];
+    for (int i = 0; i < 4; ++i) {
+        if (ch.in[i]) {
+            bufs[i] = ggml_vk_tensor_subbuffer(ctx, ch.in[i], true);
+            ggml_vk_clover_fill_input(ctx, ch.in[i], ch.L, ch.nrows, pc.in[i]);
+        } else {
+            bufs[i] = dst_buf;
+            pc.in[i][1] = 1;
+            pc.in[i][2] = 1;
+        }
+    }
+    const bool elementwise = ch.mode == VK_CLOVER_ROUND || ch.mode == VK_CLOVER_GDN_GATE ||
+                             ch.mode == VK_CLOVER_ATTN_GATE || ch.mode == VK_CLOVER_ROUND_ADD;
+    const uint32_t groups = elementwise ? CEIL_DIV(ch.L * ch.nrows, 128u) :
+                            ch.mode == VK_CLOVER_SHEXP ? ch.nrows * CEIL_DIV(ch.L, 128u) : ch.nrows;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { bufs[0], bufs[1], bufs[2], bufs[3], dst_buf }, pc, { groups, 1, 1 });
+}
+
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
@@ -13164,7 +13741,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     ggml_tensor * src2 = node->src[2];
     ggml_tensor * src3 = node->src[3];
 
-    if (node->op == GGML_OP_ADD) {
+    const auto clover_it = ctx->clover_chains.find(node);
+    const vk_clover_chain * clover = clover_it != ctx->clover_chains.end() ? &clover_it->second : nullptr;
+
+    if (node->op == GGML_OP_ADD && !clover) {
         int next_node_idx = node_idx + 1 + ctx->num_additional_fused_ops;
         if (next_node_idx < cgraph->n_nodes &&
             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
@@ -13221,9 +13801,18 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             return false;
         };
 
+        if (clover) {
+            // a fused chain reads its external inputs and writes its tail (and the cache for GDN_STATE)
+            for (const ggml_tensor * w : clover->writes) {
+                need_sync = need_sync || overlaps_unsynced(w, ctx->unsynced_nodes_read) || overlaps_unsynced(w, ctx->unsynced_nodes_written);
+            }
+            for (const ggml_tensor * r : clover->reads) {
+                need_sync = need_sync || overlaps_unsynced(r, ctx->unsynced_nodes_written);
+            }
+        }
         // For all fused ops, check if the destination node or any of the source
         // nodes require synchronization.
-        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync; ++i) {
+        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync && !clover; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // If the node actually writes to memory, then check if it needs to sync
             if (ctx->fused_ops_write_mask & (1 << i)) {
@@ -13257,8 +13846,16 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 ggml_vk_sync_buffers(ctx, compute_ctx);
             }
         }
+        if (clover) {
+            for (const ggml_tensor * w : clover->writes) {
+                ctx->unsynced_nodes_written.push_back(w);
+            }
+            for (const ggml_tensor * r : clover->reads) {
+                ctx->unsynced_nodes_read.push_back(r);
+            }
+        }
         // Add all fused nodes to the unsynchronized lists.
-        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !clover; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
             if (ctx->fused_ops_write_mask & (1 << i)) {
@@ -13290,6 +13887,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     // closed explicitly below, and by the destructor on the early returns
     ggml_vk_debug_label dbg(compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops);
 
+    if (clover) {
+        ggml_vk_clover_fused(ctx, compute_ctx, *clover);
+    } else
     switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
@@ -15349,7 +15949,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submit_count++;
     };
 
+    if (ctx->device->disable_fusion) {
+        ctx->clover_chains.clear();
+        ctx->clover_skip.clear();
+        ctx->clover_graph_sig = 0;
+    } else {
+        const uint64_t sig = ggml_vk_clover_graph_sig(cgraph);
+        if (sig != ctx->clover_graph_sig) {
+            ggml_vk_clover_detect(cgraph, ctx->clover_chains, ctx->clover_skip);
+            ctx->clover_graph_sig = sig;
+        }
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (!ctx->clover_skip.empty() && ctx->clover_skip.count(cgraph->nodes[i])) {
+            continue;
+        }
         if (first_node_in_batch) {
             submit_node_idx = i;
         }
@@ -15384,7 +15999,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
-        if (!ctx->device->disable_fusion) {
+        const auto clover_it = ctx->clover_chains.find(cgraph->nodes[i]);
+        if (clover_it != ctx->clover_chains.end()) {
+            fusion_string = vk_clover_mode_names[clover_it->second.mode];
+        } else if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -15571,6 +16189,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
+        bool spans_clover = false;
+        for (int k = 1; k <= ctx->num_additional_fused_ops && !ctx->clover_skip.empty(); ++k) {
+            spans_clover |= ctx->clover_skip.count(cgraph->nodes[i + k]) || ctx->clover_chains.count(cgraph->nodes[i + k]);
+        }
+        if (spans_clover) {
+            ctx->num_additional_fused_ops = 0;
+            ctx->fused_ops_write_mask = 0;
+            ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+            ctx->fused_topk_moe_scale = false;
+            ctx->fused_topk_qsa = false;
+            ctx->fused_hc_post_gate = false;
+            ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+            fusion_string = nullptr;
+        }
         ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
 
         // Check whether fusion would overwrite src operands while they're still in use.
@@ -15739,6 +16371,18 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // fused Clover chains read their inputs at the tail, so keep the inputs allocated until then
+    if (!ctx->device->disable_fusion && params) {
+        std::unordered_map<const ggml_tensor *, vk_clover_chain> chains;
+        std::unordered_set<const ggml_tensor *> skip;
+        ggml_vk_clover_detect(graph, chains, skip);
+        for (const auto & it : chains) {
+            for (const ggml_tensor * in : it.second.reads) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(in), it.second.tail);
+            }
+        }
+    }
 
     if (ctx->device->disable_graph_optimize) {
         return;

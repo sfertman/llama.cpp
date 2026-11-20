@@ -1,0 +1,190 @@
+#version 450
+
+// Fused element-wise / row chains of the Clover MoE graph (bf16 rounding, l2 norm, GDN gate,
+// shared expert gate, attention output gate, residual add, gated rms norm).
+// One workgroup per output row; inputs are addressed by flattening the output index into each
+// input's own [ne0, ne1, *] layout, so broadcast inputs use s1 = s2 = 0.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+#include "types.glsl"
+
+#define MODE_ROUND      0
+#define MODE_L2_NORM    1
+#define MODE_GDN_GATE   2
+#define MODE_SHEXP      3
+#define MODE_ATTN_GATE  4
+#define MODE_ROUND_ADD  5
+#define MODE_GATED_NORM 6
+
+#define FLAG_ROUND_A   1u
+#define FLAG_ROUND_B   2u
+#define FLAG_ROUND_OUT 4u
+
+layout(constant_id = 0) const uint MODE = 0;
+
+#define BLOCK_SIZE 128
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint L;
+    uint nrows;
+    uint a_off, a_ne0, a_ne1, a_s1, a_s2;
+    uint b_off, b_ne0, b_ne1, b_s1, b_s2;
+    uint c_off, c_ne0, c_ne1, c_s1, c_s2;
+    uint d_off, d_ne0, d_ne1, d_s1, d_s2;
+    uint dst_off;
+    uint flags;
+    float p0;
+    float p1;
+} p;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) readonly buffer C { float data_c[]; };
+layout(binding = 3) readonly buffer D { float data_d[]; };
+layout(binding = 4) writeonly buffer O { float data_o[]; };
+
+shared float sumsh[BLOCK_SIZE];
+
+float round_bf16(float x) {
+    return bf16_to_fp32(fp32_to_bf16(x));
+}
+
+// ne0 == 0 marks a contiguous input of the output's size
+uint flat_idx(uint n, uint off, uint ne0, uint ne1, uint s1, uint s2) {
+    if (ne0 == 0) {
+        return off + n;
+    }
+    if (s1 == 0 && s2 == 0) {
+        return off + n % ne0;
+    }
+    const uint i0 = n % ne0;
+    const uint t  = n / ne0;
+    return off + i0 + (t % ne1) * s1 + (t / ne1) * s2;
+}
+
+float load_a(uint n) { return data_a[flat_idx(n, p.a_off, p.a_ne0, p.a_ne1, p.a_s1, p.a_s2)]; }
+float load_b(uint n) { return data_b[flat_idx(n, p.b_off, p.b_ne0, p.b_ne1, p.b_s1, p.b_s2)]; }
+float load_c(uint n) { return data_c[flat_idx(n, p.c_off, p.c_ne0, p.c_ne1, p.c_s1, p.c_s2)]; }
+float load_d(uint n) { return data_d[flat_idx(n, p.d_off, p.d_ne0, p.d_ne1, p.d_s1, p.d_s2)]; }
+
+float in_a(uint n) {
+    const float v = load_a(n);
+    return (p.flags & FLAG_ROUND_A) != 0 ? round_bf16(v) : v;
+}
+
+float in_b(uint n) {
+    const float v = load_b(n);
+    return (p.flags & FLAG_ROUND_B) != 0 ? round_bf16(v) : v;
+}
+
+void store(uint n, float v) {
+    data_o[p.dst_off + n] = (p.flags & FLAG_ROUND_OUT) != 0 ? round_bf16(v) : v;
+}
+
+float reduce_sum(float partial) {
+    partial = subgroupAdd(partial);
+    if (gl_SubgroupInvocationID == 0) {
+        sumsh[gl_SubgroupID] = partial;
+    }
+    barrier();
+    float result = 0.0f;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) {
+        result += sumsh[i];
+    }
+    barrier();
+    return result;
+}
+
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+float op_silu(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+float op_softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+
+    // element-wise modes: one thread per element
+    if (MODE == MODE_ROUND || MODE == MODE_GDN_GATE || MODE == MODE_ATTN_GATE || MODE == MODE_ROUND_ADD) {
+        const uint n = gl_WorkGroupID.x * BLOCK_SIZE + tid;
+        if (n >= p.L * p.nrows) {
+            return;
+        }
+        if (MODE == MODE_ROUND) {
+            store(n, in_a(n));
+        } else if (MODE == MODE_GDN_GATE) {
+            // softplus(alpha + dt_bias) * -exp(A_log)
+            const float sp = op_softplus(load_a(n) + load_b(n));
+            store(n, sp * -exp(load_c(n)));
+        } else if (MODE == MODE_ATTN_GATE) {
+            store(n, in_a(n) * op_sigmoid(load_b(n)));
+        } else {
+            store(n, in_a(n) + in_b(n));
+        }
+        return;
+    }
+
+    if (MODE == MODE_SHEXP) {
+        // moe_out + shexp * sigmoid(dot(x, w)); each workgroup recomputes the row dot for its slice
+        const uint groups_per_row = (p.L + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const uint srow = gl_WorkGroupID.x / groups_per_row;
+        const uint c0 = (gl_WorkGroupID.x % groups_per_row) * BLOCK_SIZE;
+        if (srow >= p.nrows) {
+            return;
+        }
+        const uint sbase = srow * p.L;
+        float sum = 0.0f;
+        for (uint c = tid; c < p.L; c += BLOCK_SIZE) {
+            sum += load_c(sbase + c) * load_d(sbase + c);
+        }
+        const float g = op_sigmoid(reduce_sum(sum));
+        const uint c = c0 + tid;
+        if (c < p.L) {
+            store(sbase + c, in_a(sbase + c) + load_b(sbase + c) * g);
+        }
+        return;
+    }
+
+    // row modes: one workgroup per row
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.nrows) {
+        return;
+    }
+    const uint base = row * p.L;
+
+    if (MODE == MODE_L2_NORM) {
+        float sum = 0.0f;
+        for (uint c = tid; c < p.L; c += BLOCK_SIZE) {
+            const float v = load_a(base + c);
+            sum += v * v;
+        }
+        sum = reduce_sum(sum);
+        const float norm = sqrt(sum * p.p0 + p.p1);
+        for (uint c = tid; c < p.L; c += BLOCK_SIZE) {
+            store(base + c, load_a(base + c) / norm);
+        }
+    } else if (MODE == MODE_GATED_NORM) {
+        // rms_norm(x) * w * silu(z)
+        float sum = 0.0f;
+        for (uint c = tid; c < p.L; c += BLOCK_SIZE) {
+            const float v = in_a(base + c);
+            sum += v * v;
+        }
+        sum = reduce_sum(sum);
+        const float scale = inversesqrt(sum / float(p.L) + p.p0);
+        for (uint c = tid; c < p.L; c += BLOCK_SIZE) {
+            const float v = scale * in_a(base + c) * load_d(base + c);
+            store(base + c, v * op_silu(load_b(base + c)));
+        }
+    }
+}

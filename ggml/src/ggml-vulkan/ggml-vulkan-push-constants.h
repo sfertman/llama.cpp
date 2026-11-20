@@ -538,6 +538,17 @@ struct vk_op_topk_moe_push_constants {
     float output_bias;
 };
 
+struct vk_op_clover_fused_push_constants {
+    uint32_t L;
+    uint32_t nrows;
+    uint32_t in[4][5]; // off, ne0, ne1, s1, s2 for A, B, C, D
+    uint32_t dst_off;
+    uint32_t flags;
+    float p0;
+    float p1;
+};
+static_assert(sizeof(vk_op_clover_fused_push_constants) <= 128, "push constants too large");
+
 struct vk_op_add_id_push_constants {
     uint32_t ne0;
     uint32_t ne1;
@@ -792,6 +803,14 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+};
+
+struct vk_op_gated_delta_net_ind_push_constants {
+    vk_op_gated_delta_net_push_constants base;
+    uint32_t ids_off;
+    uint32_t row_elems;
+    uint32_t state_in_off;
+    uint32_t state_out_off;
 };
 
 struct vk_op_ssm_scan_push_constants {
