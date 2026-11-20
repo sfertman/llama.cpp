@@ -7,7 +7,9 @@ void llama_model_clover_moe::load_arch_hparams(llama_model_loader & ml) {
     }
 
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
-    ml.get_key(LLM_KV_EXPERT_SHARED_COUNT, hparams.n_expert_shared);
+    // the pre-merge GGUF has no shared expert count; Clover has one shared expert (converter default)
+    hparams.n_expert_shared = 1;
+    ml.get_key(LLM_KV_EXPERT_SHARED_COUNT, hparams.n_expert_shared, false);
     if (hparams.n_expert_shared > 0) {
         ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
     }
@@ -52,8 +54,24 @@ void llama_model_clover_moe::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_clover_moe::load_arch_tensors(llama_model_loader &) {
+void llama_model_clover_moe::load_arch_tensors(llama_model_loader & loader) {
     LLAMA_LOAD_LOCALS;
+
+    // the pre-merge GGUF stores diffusion-only tensors: count them as consumed so the loader's
+    // tensor count check passes; they are never allocated or read
+    for (const auto & it : loader.weights_map) {
+        const std::string & name = it.first;
+        const bool bd = name.find(".ssm_bd_") != std::string::npos;
+        static const std::string suffix = ".ssm_conv1d.weight_right";
+        const bool conv_right = name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+        if (bd || conv_right) {
+            legacy_raw_a_log = true;
+            loader.n_created++;
+        }
+    }
+    if (legacy_raw_a_log) {
+        LLAMA_LOG_INFO("%s: legacy Clover GGUF: ignoring diffusion tensors, ssm_a is raw A_log\n", __func__);
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -315,7 +333,11 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);
+    ggml_tensor * ssm_a = model.layers[il].ssm_a;
+    if (static_cast<const llama_model_clover_moe &>(model).legacy_raw_a_log) {
+        ssm_a = ggml_neg(ctx0, ggml_exp(ctx0, ssm_a)); // A = -exp(A_log)
+    }
+    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, ssm_a);
     cb(gate, "gate", il);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);

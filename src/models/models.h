@@ -3008,6 +3008,10 @@ struct llama_model_clover_moe : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // official Clover-35B-A3B-Preview GGUF (pre-merge converter): ssm_a holds raw A_log and the
+    // file also carries diffusion-only tensors that the AR graph does not use
+    bool legacy_raw_a_log = false;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
     private:
